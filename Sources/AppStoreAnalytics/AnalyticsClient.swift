@@ -16,6 +16,8 @@ actor AnalyticsClient {
     private var sessionStartedAt: Date?
     private var lastBackgroundAt: Date?
     private var isFlushing = false
+    private var retryAttempt = 0
+    private var retryTask: Task<Void, Never>?
 
     private var installationKey: String { "asa.\(projectKey).installation_id" }
     private var secretKey: String { "asa.\(projectKey).installation_secret" }
@@ -59,7 +61,15 @@ actor AnalyticsClient {
 
     func setCollectionEnabled(_ value: Bool) async {
         enabled = value
-        if value { await beginSessionIfNeeded() }
+        if value {
+            await beginSessionIfNeeded()
+        } else {
+            retryTask?.cancel()
+            retryTask = nil
+            retryAttempt = 0
+            queue.removeAll()
+            await persistence.saveEvents(queue)
+        }
     }
 
     func track(_ name: String, properties: [String: AnalyticsValue]) async {
@@ -76,7 +86,11 @@ actor AnalyticsClient {
 
     func enteredForeground() async {
         guard enabled else { return }
-        if let lastBackgroundAt, now().timeIntervalSince(lastBackgroundAt) < configuration.sessionTimeout { return }
+        if let lastBackgroundAt, now().timeIntervalSince(lastBackgroundAt) < configuration.sessionTimeout {
+            sessionStartedAt = now()
+            self.lastBackgroundAt = nil
+            return
+        }
         await beginSessionIfNeeded(forceNew: true)
     }
 
@@ -107,10 +121,14 @@ actor AnalyticsClient {
             let sent = Set(batchEvents.map(\.id))
             queue.removeAll { sent.contains($0.id) }
             await persistence.saveEvents(queue)
+            retryAttempt = 0
+            retryTask?.cancel()
+            retryTask = nil
         } catch {
             #if DEBUG
             print("[AppStoreAnalytics] Flush deferred: \(error)")
             #endif
+            scheduleRetry()
         }
     }
 
@@ -119,6 +137,9 @@ actor AnalyticsClient {
             try? await transport.deleteInstallation(id: installationId, secret: installationSecret, projectKey: projectKey, endpoint: configuration.endpoint)
         }
         queue.removeAll()
+        retryTask?.cancel()
+        retryTask = nil
+        retryAttempt = 0
         await persistence.saveEvents(queue)
         await persistence.setString(nil, for: secretKey)
         await persistence.setBool(false, for: firstOpenKey)
@@ -147,6 +168,24 @@ actor AnalyticsClient {
         if queue.count > configuration.maxQueueSize { queue.removeFirst(queue.count - configuration.maxQueueSize) }
         await persistence.saveEvents(queue)
         if queue.count >= configuration.flushAt { await flush() }
+    }
+
+    private func scheduleRetry() {
+        guard enabled, retryTask == nil, !queue.isEmpty else { return }
+        retryAttempt += 1
+        let exponential = min(300.0, pow(2.0, Double(retryAttempt - 1)))
+        let delay = exponential * Double.random(in: 0.75...1.25)
+        let nanoseconds = UInt64(delay * 1_000_000_000)
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            await self?.retryAfterDelay()
+        }
+    }
+
+    private func retryAfterDelay() async {
+        retryTask = nil
+        await flush()
     }
 
     private static func context() -> EventContext {

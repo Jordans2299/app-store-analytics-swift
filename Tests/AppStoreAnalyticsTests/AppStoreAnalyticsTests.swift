@@ -23,6 +23,7 @@ actor RecordingTransport: AnalyticsTransport {
     }
     func deleteInstallation(id: UUID, secret: String, projectKey: String, endpoint: URL) async throws { deleted.append(id) }
     func batchCount() -> Int { batches.count }
+    func sentEvents() -> [AnalyticsEvent] { batches.flatMap(\.events) }
 }
 
 final class AppStoreAnalyticsTests: XCTestCase {
@@ -58,5 +59,39 @@ final class AppStoreAnalyticsTests: XCTestCase {
         let batchCount = await transport.batchCount()
         XCTAssertTrue(events.isEmpty)
         XCTAssertEqual(batchCount, 1)
+    }
+
+    func testBriefBackgroundResumesTheExistingSession() async throws {
+        let persistence = MemoryPersistence()
+        let transport = RecordingTransport()
+        let client = AnalyticsClient(
+            projectKey: "test", configuration: .init(endpoint: URL(string: "https://example.com/v1")!, flushAt: 50),
+            persistence: persistence, transport: transport
+        )
+        await client.start()
+        await client.enteredBackground()
+        let sentEvents = await transport.sentEvents()
+        let startedSession = sentEvents.first(where: { $0.name == "session_started" })?.sessionId
+        await client.enteredForeground()
+        await client.track("first_model_run", properties: [:])
+        let queuedEvents = await persistence.eventSnapshot()
+        let resumedEvent = queuedEvents.last
+
+        XCTAssertEqual(resumedEvent?.sessionId, startedSession)
+    }
+
+    func testDisablingCollectionDeletesQueuedEvents() async throws {
+        let persistence = MemoryPersistence()
+        let transport = RecordingTransport()
+        let client = AnalyticsClient(
+            projectKey: "test", configuration: .init(endpoint: URL(string: "https://example.com/v1")!, flushAt: 50),
+            persistence: persistence, transport: transport
+        )
+        await client.start()
+        await client.track("first_model_run", properties: [:])
+        await client.setCollectionEnabled(false)
+
+        let events = await persistence.eventSnapshot()
+        XCTAssertTrue(events.isEmpty)
     }
 }
