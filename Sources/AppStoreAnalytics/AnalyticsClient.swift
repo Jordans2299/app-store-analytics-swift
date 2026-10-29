@@ -1,27 +1,53 @@
 import Foundation
 
+/// A session as this SDK defines it: one period of use, ended by `sessionTimeout` of inactivity
+/// rather than by every trip to the background. It is persisted so a session survives the app
+/// being killed and relaunched inside the timeout, and so the session it replaces can still be
+/// closed with an accurate duration.
+struct SessionState: Codable, Sendable {
+    var id: UUID
+    var startedAt: Date
+    /// Last event or backgrounding. The timeout is measured from here, and a `session_ended`
+    /// emitted later is timestamped here so it lands on the day the use actually happened.
+    var lastActivityAt: Date
+    /// Foreground time banked so far, which is what `duration_seconds` reports.
+    var engagedSeconds: Double
+}
+
 actor AnalyticsClient {
+    /// Reported on every event. Bump it with each tagged release so the data can tell installs apart.
+    static let sdkVersion = "0.2.0"
+
     private let projectKey: String
     private let configuration: AnalyticsConfiguration
     private let persistence: AnalyticsPersistence
     private let transport: AnalyticsTransport
     private let now: @Sendable () -> Date
     private let encoder = JSONEncoder()
+    private let stateEncoder = JSONEncoder()
+    private let stateDecoder = JSONDecoder()
     private let formatter: ISO8601DateFormatter
     private var queue: [AnalyticsEvent] = []
     private var enabled: Bool
     private var installationId: UUID
     private var installationSecret: String?
     private var sessionId = UUID()
-    private var sessionStartedAt: Date?
-    private var lastBackgroundAt: Date?
+    private var session: SessionState?
+    /// When the current uninterrupted foreground stretch began, or nil while backgrounded.
+    private var foregroundSince: Date?
     private var isFlushing = false
     private var retryAttempt = 0
     private var retryTask: Task<Void, Never>?
+    /// False until `start()` has loaded the installation and restored the session. The actor is
+    /// reentrant, so a launch's `didBecomeActive` or an early `track` could otherwise run while
+    /// `start()` is suspended on persistence, and open a session under a throwaway installation id.
+    private var isStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
 
     private var installationKey: String { "asa.\(projectKey).installation_id" }
     private var secretKey: String { "asa.\(projectKey).installation_secret" }
     private var firstOpenKey: String { "asa.\(projectKey).first_open_sent" }
+    private var sessionKey: String { "asa.\(projectKey).session" }
 
     init(
         projectKey: String,
@@ -42,6 +68,7 @@ actor AnalyticsClient {
     }
 
     func start() async {
+        defer { markStarted() }
         queue = await persistence.loadEvents()
         if let stored = await persistence.string(for: installationKey), let id = UUID(uuidString: stored) {
             installationId = id
@@ -50,19 +77,37 @@ actor AnalyticsClient {
         }
         installationSecret = await persistence.string(for: secretKey)
         guard enabled else { return }
+        await restoreSession()
+        // The session is settled before `first_open` is appended so that the very first event of an
+        // installation carries the session it actually belongs to. It used to be stamped with a
+        // throwaway identifier that no other event ever shared.
+        let started = await rotateSessionIfNeeded()
         if !(await persistence.bool(for: firstOpenKey)) {
             await append(name: "first_open", properties: [:])
             await persistence.setBool(true, for: firstOpenKey)
         }
-        await beginSessionIfNeeded()
+        if started { await append(name: "session_started", properties: [:]) }
     }
 
     func currentInstallationId() -> UUID { installationId }
 
+    private func markStarted() {
+        isStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func waitUntilStarted() async {
+        guard !isStarted else { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
     func setCollectionEnabled(_ value: Bool) async {
+        await waitUntilStarted()
         enabled = value
         if value {
-            await beginSessionIfNeeded()
+            if await rotateSessionIfNeeded() { await append(name: "session_started", properties: [:]) }
         } else {
             retryTask?.cancel()
             retryTask = nil
@@ -73,6 +118,7 @@ actor AnalyticsClient {
     }
 
     func track(_ name: String, properties: [String: AnalyticsValue]) async {
+        await waitUntilStarted()
         guard enabled else { return }
         do { try EventValidator.validate(name: name, properties: properties) }
         catch {
@@ -85,21 +131,26 @@ actor AnalyticsClient {
     }
 
     func enteredForeground() async {
+        await waitUntilStarted()
         guard enabled else { return }
-        if let lastBackgroundAt, now().timeIntervalSince(lastBackgroundAt) < configuration.sessionTimeout {
-            sessionStartedAt = now()
-            self.lastBackgroundAt = nil
-            return
-        }
-        await beginSessionIfNeeded(forceNew: true)
+        // Every activation asks the same question (is the previous session still alive?) instead
+        // of treating "did not come back from the background" as proof that it is not. An iOS
+        // app becomes active again after a Control Centre pull, a notification banner or an
+        // app-switcher peek without ever backgrounding, and those used to open a new session each.
+        if await rotateSessionIfNeeded() { await append(name: "session_started", properties: [:]) }
     }
 
     func enteredBackground() async {
-        guard enabled, let started = sessionStartedAt else { return }
-        let duration = max(0, Int(now().timeIntervalSince(started)))
-        await append(name: "session_ended", properties: ["duration_seconds": .integer(duration)])
-        sessionStartedAt = nil
-        lastBackgroundAt = now()
+        await waitUntilStarted()
+        guard enabled, var current = session else { return }
+        // Backgrounding banks the foreground time and stops the clock. It does not end the session:
+        // a session ends only when the timeout passes with no activity, which is the same rule the
+        // products this data is compared against use.
+        let moment = now()
+        bankForegroundTime(into: &current, until: moment)
+        current.lastActivityAt = moment
+        session = current
+        await persistSession()
         await flush()
     }
 
@@ -143,24 +194,88 @@ actor AnalyticsClient {
         await persistence.saveEvents(queue)
         await persistence.setString(nil, for: secretKey)
         await persistence.setBool(false, for: firstOpenKey)
+        await persistence.setString(nil, for: sessionKey)
         installationSecret = nil
         installationId = UUID()
         await persistence.setString(installationId.uuidString.lowercased(), for: installationKey)
         sessionId = UUID()
-        sessionStartedAt = nil
+        session = nil
+        foregroundSince = nil
         if enabled { await start() }
     }
 
-    private func beginSessionIfNeeded(forceNew: Bool = false) async {
-        guard sessionStartedAt == nil || forceNew else { return }
-        sessionId = UUID()
-        sessionStartedAt = now()
-        await append(name: "session_started", properties: [:])
+    /// Resumes the stored session when it is still inside the timeout, and otherwise closes it and
+    /// opens a new one. Returns whether a new session began, so the caller can order
+    /// `session_started` against the events around it.
+    private func rotateSessionIfNeeded() async -> Bool {
+        let moment = now()
+        if var current = session, moment.timeIntervalSince(current.lastActivityAt) < configuration.sessionTimeout {
+            // A foreground that follows a background restarts the clock; one that follows a
+            // transient interruption never stopped it, so the stretch in progress is left alone.
+            if foregroundSince == nil { foregroundSince = moment }
+            current.lastActivityAt = moment
+            session = current
+            await persistSession()
+            return false
+        }
+        if var expired = session {
+            bankForegroundTime(into: &expired, until: expired.lastActivityAt)
+            await endSession(expired)
+        }
+        let opened = SessionState(id: UUID(), startedAt: moment, lastActivityAt: moment, engagedSeconds: 0)
+        session = opened
+        sessionId = opened.id
+        foregroundSince = moment
+        await persistSession()
+        return true
     }
 
-    private func append(name: String, properties: [String: AnalyticsValue]) async {
+    /// Closes an expired session, attributing the event to that session and timestamping it at the
+    /// last activity it saw rather than at the moment the expiry was noticed.
+    private func endSession(_ state: SessionState) async {
+        sessionId = state.id
+        session = nil
+        foregroundSince = nil
+        await persistence.setString(nil, for: sessionKey)
+        await append(
+            name: "session_ended",
+            properties: ["duration_seconds": .integer(max(0, Int(state.engagedSeconds.rounded())))],
+            at: state.lastActivityAt
+        )
+    }
+
+    private func bankForegroundTime(into state: inout SessionState, until moment: Date) {
+        guard let since = foregroundSince else { return }
+        state.engagedSeconds += max(0, moment.timeIntervalSince(since))
+        foregroundSince = nil
+    }
+
+    private func restoreSession() async {
+        guard let stored = await persistence.string(for: sessionKey), let data = stored.data(using: .utf8) else { return }
+        guard let state = try? stateDecoder.decode(SessionState.self, from: data) else { return }
+        session = state
+        sessionId = state.id
+        // The process is new, so nothing is banked yet: the clock starts when the session is
+        // resumed or replaced, a few statements from here.
+        foregroundSince = nil
+    }
+
+    private func persistSession() async {
+        guard let session, let data = try? stateEncoder.encode(session), let text = String(data: data, encoding: .utf8) else { return }
+        await persistence.setString(text, for: sessionKey)
+    }
+
+    /// `at` backdates an event to when it happened. Only the deferred `session_ended` uses it, and
+    /// a backdated event is never treated as activity: it is the record of activity already past.
+    private func append(name: String, properties: [String: AnalyticsValue], at moment: Date? = nil) async {
+        let occurredAt = moment ?? now()
+        if moment == nil, var current = session {
+            current.lastActivityAt = occurredAt
+            session = current
+            await persistSession()
+        }
         let event = AnalyticsEvent(
-            id: UUID(), name: name, timestamp: formatter.string(from: now()), installationId: installationId,
+            id: UUID(), name: name, timestamp: formatter.string(from: occurredAt), installationId: installationId,
             sessionId: sessionId, properties: properties, context: Self.context()
         )
         guard let encoded = try? encoder.encode(event), encoded.count <= 8 * 1_024 else { return }
@@ -201,7 +316,7 @@ actor AnalyticsClient {
                 #endif
             }(),
             osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-            sdkVersion: "0.1.0"
+            sdkVersion: AnalyticsClient.sdkVersion
         )
     }
 }
